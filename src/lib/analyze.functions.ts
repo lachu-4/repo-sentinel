@@ -125,8 +125,32 @@ const SECRET_PATTERNS: { type: string; severity: Severity; re: RegExp }[] = [
 // Files that are likely to contain real secrets / config.
 const CODE_EXT = /\.(js|jsx|ts|tsx|mjs|cjs|py|rb|go|java|kt|php|rs|cs|swift|m|c|cpp|h|sh|yml|yaml|toml|json|env|cfg|ini|properties|xml|gradle)$/i;
 const SKIP_PATH = /(^|\/)(node_modules|dist|build|out|\.next|\.git|vendor|coverage|__pycache__|target|\.cache)(\/|$)/i;
-const MAX_FILES_TO_SCAN = 80;
+const MAX_FILES_TO_SCAN = 50;
 const MAX_FILE_BYTES = 200_000;
+const FETCH_CONCURRENCY = 12;
+
+async function fetchRawFile(owner: string, repo: string, branch: string, path: string, token: string): Promise<string | null> {
+  // Try the unauthenticated CDN first (fast, no API quota), fall back to the API.
+  const cdn = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`).catch(() => null);
+  if (cdn && cdn.ok) return cdn.text();
+  const r = await ghRaw(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path).replace(/%2F/g, "/")}?ref=${branch}`, token).catch(() => null);
+  if (!r || !r.ok) return null;
+  return r.text();
+}
+
+async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
 function severityWeight(s: Severity): number {
   return { critical: 25, high: 12, medium: 5, low: 2, info: 0 }[s];
