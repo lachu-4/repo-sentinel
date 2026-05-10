@@ -387,14 +387,17 @@ export const analyzeRepo = createServerFn({ method: "POST" })
         qualityIssues: qualityIssues.slice(0, 10),
         score: total,
       };
-      aiSummary = await callLovableAI(
-        `Analyze this GitHub repo and write a 2-3 sentence plain-English summary of what it does, based on the metadata and file paths:\n${JSON.stringify(ctx, null, 2)}`,
-        "You are a senior engineer summarizing repositories. Be concise, factual, and avoid speculation."
-      );
-      const sugRaw = await callLovableAI(
-        `Given this analysis, propose 4 concrete improvement suggestions focused on security and code structure. Reply ONLY with a JSON array, each item: {"title":"...","detail":"...","severity":"critical|high|medium|low"}. Analysis:\n${JSON.stringify(ctx, null, 2)}`,
-        "You are a security-focused code reviewer. Output strict JSON only, no prose, no markdown fences."
-      );
+      const [summaryRes, sugRaw] = await Promise.all([
+        callLovableAI(
+          `Analyze this GitHub repo and write a 2-3 sentence plain-English summary of what it does, based on the metadata and file paths:\n${JSON.stringify(ctx, null, 2)}`,
+          "You are a senior engineer summarizing repositories. Be concise, factual, and avoid speculation."
+        ),
+        callLovableAI(
+          `Given this analysis, propose 4 concrete improvement suggestions focused on security and code structure. Reply ONLY with a JSON array, each item: {"title":"...","detail":"...","severity":"critical|high|medium|low"}. Analysis:\n${JSON.stringify(ctx, null, 2)}`,
+          "You are a security-focused code reviewer. Output strict JSON only, no prose, no markdown fences."
+        ),
+      ]);
+      aiSummary = summaryRes;
       const cleaned = sugRaw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(cleaned);
       if (Array.isArray(parsed)) aiSuggestions = parsed.slice(0, 6);
