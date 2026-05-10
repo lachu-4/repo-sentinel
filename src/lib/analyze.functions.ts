@@ -125,8 +125,32 @@ const SECRET_PATTERNS: { type: string; severity: Severity; re: RegExp }[] = [
 // Files that are likely to contain real secrets / config.
 const CODE_EXT = /\.(js|jsx|ts|tsx|mjs|cjs|py|rb|go|java|kt|php|rs|cs|swift|m|c|cpp|h|sh|yml|yaml|toml|json|env|cfg|ini|properties|xml|gradle)$/i;
 const SKIP_PATH = /(^|\/)(node_modules|dist|build|out|\.next|\.git|vendor|coverage|__pycache__|target|\.cache)(\/|$)/i;
-const MAX_FILES_TO_SCAN = 80;
+const MAX_FILES_TO_SCAN = 50;
 const MAX_FILE_BYTES = 200_000;
+const FETCH_CONCURRENCY = 12;
+
+async function fetchRawFile(owner: string, repo: string, branch: string, path: string, token: string): Promise<string | null> {
+  // Try the unauthenticated CDN first (fast, no API quota), fall back to the API.
+  const cdn = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`).catch(() => null);
+  if (cdn && cdn.ok) return cdn.text();
+  const r = await ghRaw(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path).replace(/%2F/g, "/")}?ref=${branch}`, token).catch(() => null);
+  if (!r || !r.ok) return null;
+  return r.text();
+}
+
+async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
 function severityWeight(s: Severity): number {
   return { critical: 25, high: 12, medium: 5, low: 2, info: 0 }[s];
@@ -239,12 +263,17 @@ export const analyzeRepo = createServerFn({ method: "POST" })
 
     const { owner, repo } = parseRepo(data.repoUrl);
 
-    // 1. Repo metadata
+    // 1. Repo metadata (need this first for default branch)
     const meta = await gh(`/repos/${owner}/${repo}`, token);
     const defaultBranch = meta.default_branch || "main";
 
-    // 2. Tree
-    const tree = await gh(`/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, token).catch(() => ({ tree: [] }));
+    // 2. Run tree + activity calls in parallel
+    const [tree, commitsList, contributorsList] = await Promise.all([
+      gh(`/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, token).catch(() => ({ tree: [] })),
+      gh(`/repos/${owner}/${repo}/commits?per_page=30`, token).catch(() => []),
+      gh(`/repos/${owner}/${repo}/contributors?per_page=100&anon=1`, token).catch(() => []),
+    ]);
+
     const files: { path: string; size: number }[] = (tree.tree || [])
       .filter((n: any) => n.type === "blob")
       .map((n: any) => ({ path: n.path, size: n.size || 0 }));
@@ -263,37 +292,33 @@ export const analyzeRepo = createServerFn({ method: "POST" })
       })
       .slice(0, MAX_FILES_TO_SCAN);
 
-    // 4. Fetch & scan
+    // 4. Fetch & scan with bounded concurrency
     const secretFindings: SecretFinding[] = [];
     const depRisks: DependencyRisk[] = [];
     const qualityIssues: QualityIssue[] = [];
     let scanned = 0;
 
-    await Promise.all(
-      scanCandidates.map(async (f) => {
-        const r = await ghRaw(`/repos/${owner}/${repo}/contents/${encodeURIComponent(f.path).replace(/%2F/g, "/")}?ref=${defaultBranch}`, token);
-        if (!r.ok) return;
-        const content = await r.text();
-        scanned++;
-        secretFindings.push(...scanContentForSecrets(f.path, content));
-        if (/(^|\/)package\.json$/.test(f.path)) {
-          const r2 = analyzePackageJson(content);
-          depRisks.push(...r2.deps);
-          qualityIssues.push(...r2.quality);
-        }
-        if (/(^|\/)requirements\.txt$/.test(f.path)) {
-          depRisks.push(...analyzeRequirementsTxt(content));
-        }
-        // Code quality heuristics
-        const todoCount = (content.match(/\b(TODO|FIXME|HACK|XXX)\b/g) || []).length;
-        if (todoCount > 8) {
-          qualityIssues.push({ type: "High TODO/FIXME density", severity: "low", detail: `${todoCount} markers in ${f.path}` });
-        }
-        if (content.length > 80_000) {
-          qualityIssues.push({ type: "Very large file", severity: "low", detail: `${f.path} is ${(content.length / 1024).toFixed(0)} KB — consider splitting` });
-        }
-      })
-    );
+    await pool(scanCandidates, FETCH_CONCURRENCY, async (f) => {
+      const content = await fetchRawFile(owner, repo, defaultBranch, f.path, token);
+      if (content == null) return;
+      scanned++;
+      secretFindings.push(...scanContentForSecrets(f.path, content));
+      if (/(^|\/)package\.json$/.test(f.path)) {
+        const r2 = analyzePackageJson(content);
+        depRisks.push(...r2.deps);
+        qualityIssues.push(...r2.quality);
+      }
+      if (/(^|\/)requirements\.txt$/.test(f.path)) {
+        depRisks.push(...analyzeRequirementsTxt(content));
+      }
+      const todoCount = (content.match(/\b(TODO|FIXME|HACK|XXX)\b/g) || []).length;
+      if (todoCount > 8) {
+        qualityIssues.push({ type: "High TODO/FIXME density", severity: "low", detail: `${todoCount} markers in ${f.path}` });
+      }
+      if (content.length > 80_000) {
+        qualityIssues.push({ type: "Very large file", severity: "low", detail: `${f.path} is ${(content.length / 1024).toFixed(0)} KB — consider splitting` });
+      }
+    });
 
     // Dedupe secrets
     const seen = new Set<string>();
@@ -314,18 +339,13 @@ export const analyzeRepo = createServerFn({ method: "POST" })
     if (!hasCI) qualityIssues.push({ type: "No CI configuration", severity: "low", detail: "No GitHub Actions / GitLab CI / CircleCI workflows detected" });
     if (!hasTests) qualityIssues.push({ type: "No test files detected", severity: "medium", detail: "No test/spec files found in repo" });
 
-    // 5. Activity
-    const [commitsList, contributorsList] = await Promise.all([
-      gh(`/repos/${owner}/${repo}/commits?per_page=30`, token).catch(() => []),
-      gh(`/repos/${owner}/${repo}/contributors?per_page=100&anon=1`, token).catch(() => []),
-    ]);
+    // 5. Activity post-processing
     const recentCommits = (commitsList as any[]).slice(0, 8).map((c) => ({
       sha: c.sha?.slice(0, 7) ?? "",
       message: (c.commit?.message ?? "").split("\n")[0].slice(0, 100),
       author: c.commit?.author?.name ?? "unknown",
       date: c.commit?.author?.date ?? "",
     }));
-    // Bucket commits by week
     const weekMap = new Map<string, number>();
     for (const c of commitsList as any[]) {
       const d = new Date(c.commit?.author?.date ?? Date.now());
@@ -367,14 +387,17 @@ export const analyzeRepo = createServerFn({ method: "POST" })
         qualityIssues: qualityIssues.slice(0, 10),
         score: total,
       };
-      aiSummary = await callLovableAI(
-        `Analyze this GitHub repo and write a 2-3 sentence plain-English summary of what it does, based on the metadata and file paths:\n${JSON.stringify(ctx, null, 2)}`,
-        "You are a senior engineer summarizing repositories. Be concise, factual, and avoid speculation."
-      );
-      const sugRaw = await callLovableAI(
-        `Given this analysis, propose 4 concrete improvement suggestions focused on security and code structure. Reply ONLY with a JSON array, each item: {"title":"...","detail":"...","severity":"critical|high|medium|low"}. Analysis:\n${JSON.stringify(ctx, null, 2)}`,
-        "You are a security-focused code reviewer. Output strict JSON only, no prose, no markdown fences."
-      );
+      const [summaryRes, sugRaw] = await Promise.all([
+        callLovableAI(
+          `Analyze this GitHub repo and write a 2-3 sentence plain-English summary of what it does, based on the metadata and file paths:\n${JSON.stringify(ctx, null, 2)}`,
+          "You are a senior engineer summarizing repositories. Be concise, factual, and avoid speculation."
+        ),
+        callLovableAI(
+          `Given this analysis, propose 4 concrete improvement suggestions focused on security and code structure. Reply ONLY with a JSON array, each item: {"title":"...","detail":"...","severity":"critical|high|medium|low"}. Analysis:\n${JSON.stringify(ctx, null, 2)}`,
+          "You are a security-focused code reviewer. Output strict JSON only, no prose, no markdown fences."
+        ),
+      ]);
+      aiSummary = summaryRes;
       const cleaned = sugRaw.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(cleaned);
       if (Array.isArray(parsed)) aiSuggestions = parsed.slice(0, 6);

@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
+import { useRef, useState } from "react";
 import { z } from "zod";
 import {
   ResponsiveContainer,
@@ -27,10 +28,12 @@ import {
   Loader2,
   ExternalLink,
   CircleAlert,
+  Download,
 } from "lucide-react";
 import { Logo } from "@/components/repoguard/Logo";
 import { SearchBar } from "@/components/repoguard/SearchBar";
 import { analyzeRepo, type AnalysisResult, type Severity } from "@/lib/analyze.functions";
+import { exportDashboardToPdf } from "@/lib/export-pdf";
 
 const searchSchema = z.object({ repo: z.string().optional().default("") });
 
@@ -145,31 +148,59 @@ function scoreLabel(s: number) {
 }
 
 function Dashboard({ data }: { data: AnalysisResult }) {
+  const reportRef = useRef<HTMLDivElement>(null);
+  const [exporting, setExporting] = useState(false);
+
+  const handleExport = async () => {
+    if (!reportRef.current) return;
+    setExporting(true);
+    try {
+      const safeName = data.repo.fullName.replace(/[^\w.-]+/g, "_");
+      await exportDashboardToPdf(reportRef.current, `repoguard-${safeName}.pdf`);
+    } catch (e) {
+      console.error("PDF export failed", e);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      <RepoHeader data={data} />
-      <div className="grid gap-6 lg:grid-cols-3">
-        <ScoreCard data={data} />
-        <div className="lg:col-span-2 grid gap-6 sm:grid-cols-2">
-          <StatCard icon={Star} label="Stars" value={data.repo.stars.toLocaleString()} />
-          <StatCard icon={GitFork} label="Forks" value={data.repo.forks.toLocaleString()} />
-          <StatCard icon={Users} label="Contributors" value={data.activity.contributors.toLocaleString()} />
-          <StatCard icon={AlertCircle} label="Open issues" value={data.repo.openIssues.toLocaleString()} />
+      <div className="flex justify-end">
+        <button
+          onClick={handleExport}
+          disabled={exporting}
+          className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium hover:border-ring disabled:opacity-60"
+        >
+          {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          {exporting ? "Generating PDF…" : "Export PDF report"}
+        </button>
+      </div>
+      <div ref={reportRef} className="space-y-6 bg-background p-2">
+        <RepoHeader data={data} />
+        <div className="grid gap-6 lg:grid-cols-3">
+          <ScoreCard data={data} />
+          <div className="lg:col-span-2 grid gap-6 sm:grid-cols-2">
+            <StatCard icon={Star} label="Stars" value={data.repo.stars.toLocaleString()} />
+            <StatCard icon={GitFork} label="Forks" value={data.repo.forks.toLocaleString()} />
+            <StatCard icon={Users} label="Contributors" value={data.activity.contributors.toLocaleString()} />
+            <StatCard icon={AlertCircle} label="Open issues" value={data.repo.openIssues.toLocaleString()} />
+          </div>
         </div>
+
+        <AISummaryCard data={data} />
+
+        <div className="grid gap-6 lg:grid-cols-2">
+          <CategoryBreakdown data={data} />
+          <ActivityChart data={data} />
+        </div>
+
+        <FindingsTabs data={data} />
+
+        <SuggestionsCard data={data} />
+
+        <RecentCommits data={data} />
       </div>
-
-      <AISummaryCard data={data} />
-
-      <div className="grid gap-6 lg:grid-cols-2">
-        <CategoryBreakdown data={data} />
-        <ActivityChart data={data} />
-      </div>
-
-      <FindingsTabs data={data} />
-
-      <SuggestionsCard data={data} />
-
-      <RecentCommits data={data} />
     </div>
   );
 }
