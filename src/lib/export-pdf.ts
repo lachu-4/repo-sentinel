@@ -1,5 +1,5 @@
 import jsPDF from "jspdf";
-import html2canvas from "html2canvas";
+import html2canvas from "html2canvas-pro";
 
 export async function exportDashboardToPdf(element: HTMLElement, fileName: string) {
   // Resolve CSS color variables to concrete RGB so html2canvas (which doesn't
