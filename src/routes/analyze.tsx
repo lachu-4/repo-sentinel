@@ -28,10 +28,12 @@ import {
   Loader2,
   ExternalLink,
   CircleAlert,
+  Download,
 } from "lucide-react";
 import { Logo } from "@/components/repoguard/Logo";
 import { SearchBar } from "@/components/repoguard/SearchBar";
 import { analyzeRepo, type AnalysisResult, type Severity } from "@/lib/analyze.functions";
+import { exportDashboardToPdf } from "@/lib/export-pdf";
 
 const searchSchema = z.object({ repo: z.string().optional().default("") });
 
