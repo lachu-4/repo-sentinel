@@ -263,12 +263,17 @@ export const analyzeRepo = createServerFn({ method: "POST" })
 
     const { owner, repo } = parseRepo(data.repoUrl);
 
-    // 1. Repo metadata
+    // 1. Repo metadata (need this first for default branch)
     const meta = await gh(`/repos/${owner}/${repo}`, token);
     const defaultBranch = meta.default_branch || "main";
 
-    // 2. Tree
-    const tree = await gh(`/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, token).catch(() => ({ tree: [] }));
+    // 2. Run tree + activity calls in parallel
+    const [tree, commitsList, contributorsList] = await Promise.all([
+      gh(`/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, token).catch(() => ({ tree: [] })),
+      gh(`/repos/${owner}/${repo}/commits?per_page=30`, token).catch(() => []),
+      gh(`/repos/${owner}/${repo}/contributors?per_page=100&anon=1`, token).catch(() => []),
+    ]);
+
     const files: { path: string; size: number }[] = (tree.tree || [])
       .filter((n: any) => n.type === "blob")
       .map((n: any) => ({ path: n.path, size: n.size || 0 }));
@@ -287,37 +292,33 @@ export const analyzeRepo = createServerFn({ method: "POST" })
       })
       .slice(0, MAX_FILES_TO_SCAN);
 
-    // 4. Fetch & scan
+    // 4. Fetch & scan with bounded concurrency
     const secretFindings: SecretFinding[] = [];
     const depRisks: DependencyRisk[] = [];
     const qualityIssues: QualityIssue[] = [];
     let scanned = 0;
 
-    await Promise.all(
-      scanCandidates.map(async (f) => {
-        const r = await ghRaw(`/repos/${owner}/${repo}/contents/${encodeURIComponent(f.path).replace(/%2F/g, "/")}?ref=${defaultBranch}`, token);
-        if (!r.ok) return;
-        const content = await r.text();
-        scanned++;
-        secretFindings.push(...scanContentForSecrets(f.path, content));
-        if (/(^|\/)package\.json$/.test(f.path)) {
-          const r2 = analyzePackageJson(content);
-          depRisks.push(...r2.deps);
-          qualityIssues.push(...r2.quality);
-        }
-        if (/(^|\/)requirements\.txt$/.test(f.path)) {
-          depRisks.push(...analyzeRequirementsTxt(content));
-        }
-        // Code quality heuristics
-        const todoCount = (content.match(/\b(TODO|FIXME|HACK|XXX)\b/g) || []).length;
-        if (todoCount > 8) {
-          qualityIssues.push({ type: "High TODO/FIXME density", severity: "low", detail: `${todoCount} markers in ${f.path}` });
-        }
-        if (content.length > 80_000) {
-          qualityIssues.push({ type: "Very large file", severity: "low", detail: `${f.path} is ${(content.length / 1024).toFixed(0)} KB — consider splitting` });
-        }
-      })
-    );
+    await pool(scanCandidates, FETCH_CONCURRENCY, async (f) => {
+      const content = await fetchRawFile(owner, repo, defaultBranch, f.path, token);
+      if (content == null) return;
+      scanned++;
+      secretFindings.push(...scanContentForSecrets(f.path, content));
+      if (/(^|\/)package\.json$/.test(f.path)) {
+        const r2 = analyzePackageJson(content);
+        depRisks.push(...r2.deps);
+        qualityIssues.push(...r2.quality);
+      }
+      if (/(^|\/)requirements\.txt$/.test(f.path)) {
+        depRisks.push(...analyzeRequirementsTxt(content));
+      }
+      const todoCount = (content.match(/\b(TODO|FIXME|HACK|XXX)\b/g) || []).length;
+      if (todoCount > 8) {
+        qualityIssues.push({ type: "High TODO/FIXME density", severity: "low", detail: `${todoCount} markers in ${f.path}` });
+      }
+      if (content.length > 80_000) {
+        qualityIssues.push({ type: "Very large file", severity: "low", detail: `${f.path} is ${(content.length / 1024).toFixed(0)} KB — consider splitting` });
+      }
+    });
 
     // Dedupe secrets
     const seen = new Set<string>();
@@ -338,18 +339,13 @@ export const analyzeRepo = createServerFn({ method: "POST" })
     if (!hasCI) qualityIssues.push({ type: "No CI configuration", severity: "low", detail: "No GitHub Actions / GitLab CI / CircleCI workflows detected" });
     if (!hasTests) qualityIssues.push({ type: "No test files detected", severity: "medium", detail: "No test/spec files found in repo" });
 
-    // 5. Activity
-    const [commitsList, contributorsList] = await Promise.all([
-      gh(`/repos/${owner}/${repo}/commits?per_page=30`, token).catch(() => []),
-      gh(`/repos/${owner}/${repo}/contributors?per_page=100&anon=1`, token).catch(() => []),
-    ]);
+    // 5. Activity post-processing
     const recentCommits = (commitsList as any[]).slice(0, 8).map((c) => ({
       sha: c.sha?.slice(0, 7) ?? "",
       message: (c.commit?.message ?? "").split("\n")[0].slice(0, 100),
       author: c.commit?.author?.name ?? "unknown",
       date: c.commit?.author?.date ?? "",
     }));
-    // Bucket commits by week
     const weekMap = new Map<string, number>();
     for (const c of commitsList as any[]) {
       const d = new Date(c.commit?.author?.date ?? Date.now());
